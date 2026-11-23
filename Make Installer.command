@@ -10,6 +10,13 @@
 # the patch number is bumped (1.5.2 → 1.5.3) in pixelpress.py before building - unless that release is
 # the Windows build (make_installer_windows.py) of exactly this pixelpress.py, which the Mac build joins.
 # To jump to a specific version instead:  ./"Make Installer.command" 1.6.0
+#
+# Signing: with these three set, the app is signed with your Developer ID (hardened runtime), the .pkg
+# with your Developer ID Installer certificate, and both are notarized and stapled. Without them the
+# build is ad-hoc signed, which is fine for local testing but shows Gatekeeper warnings elsewhere.
+#   export PIXELPRESS_CODESIGN_IDENTITY="Developer ID Application: Pixel Mosaic LLC (TEAMID)"
+#   export PIXELPRESS_INSTALLER_IDENTITY="Developer ID Installer: Pixel Mosaic LLC (TEAMID)"
+#   export PIXELPRESS_NOTARY_PROFILE=<profile saved once with: xcrun notarytool store-credentials>
 set -e
 cd "$(dirname "$0")"
 SRC_DIR="$(pwd)"
@@ -52,6 +59,43 @@ fi
 [ "$VERSION" != "$OLD_VERSION" ] && { set_version "$VERSION"; echo "Version bumped: $OLD_VERSION → $VERSION"; }
 
 [ "$(uname -m)" = "arm64" ] || fail "Build this on an Apple Silicon Mac."
+
+# Signing set-up (see the top of this file)
+SIGN_ID="${PIXELPRESS_CODESIGN_IDENTITY:--}"
+INST_ID="${PIXELPRESS_INSTALLER_IDENTITY:-}"
+NOTARY="${PIXELPRESS_NOTARY_PROFILE:-}"
+if [ "$SIGN_ID" != "-" ]; then
+  security find-identity -v -p codesigning | grep -qF "$SIGN_ID" \
+    || fail "Signing certificate not found in the keychain: $SIGN_ID"
+  [ -n "$INST_ID" ] || fail "Set PIXELPRESS_INSTALLER_IDENTITY too (your Developer ID Installer certificate)"
+  security find-identity -v | grep -qF "$INST_ID" \
+    || fail "Installer certificate not found in the keychain: $INST_ID"
+  [ -n "$NOTARY" ] || fail "Set PIXELPRESS_NOTARY_PROFILE too (from: xcrun notarytool store-credentials)"
+  [ -f entitlements.plist ] || fail "Source Code/entitlements.plist is missing"
+  echo "Signing as: $SIGN_ID"
+else
+  echo "⚠ No Developer ID set: ad-hoc signed build (local testing only)"
+fi
+
+# Signs the app inside-out: every Mach-O file (keeping any entitlements it already has, e.g. hapr_enc's),
+# then nested bundles, then the app itself with entitlements.plist. Ad-hoc mode keeps the old behaviour.
+sign_app() {
+  local app="$1" f
+  if [ "$SIGN_ID" = "-" ]; then codesign --force --deep --sign - "$app" 2>/dev/null || true; return 0; fi
+  while IFS= read -r -d '' f; do
+    file -b "$f" | grep -q 'Mach-O' || continue
+    [ "$f" = "$app/Contents/MacOS/PixelPress" ] && continue
+    codesign --force --timestamp --options runtime --preserve-metadata=entitlements \
+             --sign "$SIGN_ID" "$f" >/dev/null 2>&1 || fail "could not sign $f"
+  done < <(find "$app/Contents" -type f -print0)
+  while IFS= read -r -d '' f; do
+    codesign --force --timestamp --options runtime --sign "$SIGN_ID" "$f" >/dev/null 2>&1 || fail "could not sign $f"
+  done < <(find "$app/Contents" -depth -type d \( -name '*.framework' -o -name '*.bundle' -o -name '*.app' \) -print0)
+  codesign --force --timestamp --options runtime --entitlements entitlements.plist \
+           --sign "$SIGN_ID" "$app" || fail "could not sign PixelPress.app"
+  codesign --verify --strict --deep "$app" || fail "PixelPress.app signature check failed"
+  echo "✓ PixelPress.app signed with Developer ID"
+}
 [ -n "$PY" ] || fail "No Python with Tk 8.6 found (Homebrew's Python 3.14 has Tk 9, which shows the dropdowns as empty windows).
   Install Python 3.13 from python.org (macOS 64-bit universal2 installer), then run this again."
 echo "Python: $PY (Tk $("$PY" -c 'import tkinter; print(tkinter.TkVersion)'))"
@@ -116,7 +160,7 @@ APP="$DEPLOY/dist/PixelPress.app"
 find "$APP" -path "*tkinterdnd2/tkdnd/osx-arm64*" -name "*.dylib" | grep -q . || fail "drag and drop library (tkdnd) didn't make it into the app bundle"
 [ -f "$APP/Contents/Frameworks/THIRD-PARTY-LICENSES.txt" ] || [ -f "$APP/Contents/Resources/THIRD-PARTY-LICENSES.txt" ] \
   || fail "licence file didn't make it into the app bundle"
-codesign --force --deep --sign - "$APP" 2>/dev/null || true
+sign_app "$APP"
 rm -rf "$DEPLOY/PixelPress.app" && cp -R "$APP" "$DEPLOY/PixelPress.app"
 
 # 3b. Command-line self-test (ffmpeg-style CLI used by Smart Preso etc.)
@@ -186,9 +230,24 @@ cat > "$STAGE/distribution.xml" <<DIST
     <pkg-ref id="com.pixelpress.app" version="$VERSION" onConclusion="none">component.pkg</pkg-ref>
 </installer-gui-script>
 DIST
-productbuild --distribution "$STAGE/distribution.xml" --resources "$STAGE/res" \
+PB_SIGN=(); [ "$SIGN_ID" != "-" ] && PB_SIGN=(--sign "$INST_ID" --timestamp)
+productbuild "${PB_SIGN[@]}" --distribution "$STAGE/distribution.xml" --resources "$STAGE/res" \
              --package-path "$STAGE" "$PKG" >/dev/null || fail "productbuild failed"
 rm -rf "$STAGE"
+
+# 4a. Notarize and staple (Developer ID builds only)
+if [ "$SIGN_ID" != "-" ]; then
+  echo "Notarizing (usually a few minutes) ..."
+  NLOG=$(mktemp)
+  xcrun notarytool submit "$PKG" --keychain-profile "$NOTARY" --wait | tee "$NLOG"
+  grep -q "status: Accepted" "$NLOG" \
+    || fail "Notarization was not accepted. Details: xcrun notarytool log <submission id> --keychain-profile $NOTARY"
+  rm -f "$NLOG"
+  xcrun stapler staple "$PKG" >/dev/null || fail "stapling the .pkg failed"
+  xcrun stapler staple "$APP" >/dev/null || echo "⚠ could not staple the app itself (the zip still passes Gatekeeper when online)"
+  spctl -a -vv -t install "$PKG" 2>&1 | grep -q accepted || fail "Gatekeeper does not accept the .pkg"
+  echo "✓ notarized and stapled"
+fi
 
 # 4b. Licences + source packages for the release folder
 cp licenses/THIRD-PARTY-LICENSES.txt licenses/LICENSE.txt "$OUT/"

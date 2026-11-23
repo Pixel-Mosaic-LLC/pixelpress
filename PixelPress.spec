@@ -23,7 +23,7 @@ else:
     for _b in ('ffmpeg', 'ffprobe', 'pphap'):  # portable ffmpeg (Make Installer.command) + plugin encoder
         if os.path.isfile(os.path.join(_tp, _b)):
             _bins.append((os.path.join(_tp, _b), '.'))
-    _ctk  = [('/opt/homebrew/lib/python3.14/site-packages/customtkinter', 'customtkinter')]
+    _ctk  = collect_data_files('customtkinter')   # from whichever Python runs the build
 
 # drag and drop (tkdnd native library + Tcl scripts, from the tkinterdnd2 package)
 _dnd_datas = collect_data_files('tkinterdnd2')
@@ -68,7 +68,7 @@ else:
         debug=False,
         bootloader_ignore_signals=False,
         strip=False,
-        upx=True,
+        upx=False,   # UPX-compressed binaries can't be Developer ID signed / notarized
         console=False,
         disable_windowed_traceback=False,
         argv_emulation=False,
@@ -82,7 +82,7 @@ else:
         a.binaries,
         a.datas,
         strip=False,
-        upx=True,
+        upx=False,
         upx_exclude=[],
         name='PixelPress',
     )
